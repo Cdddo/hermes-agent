@@ -161,6 +161,9 @@ _NATIVE_SLASH_COMMANDS: tuple = (
     ("btw", "Ask a side question about the current conversation",
      (("question", str, _REQUIRED, "The side question to answer without interrupting", None),),
      "/btw {question}", "Side question dispatched~"),
+    # /voicemode: template None -> registered by _register_voicemode_slash (custom handler:
+    # toggles voice input mode live, persisted to discord.voice_ptt_mode).
+    ("voicemode", "Show or toggle voice input mode (push-to-talk vs open mic)", (), None, None),
 )
 _DISCORD_SELECT_FIELD_LIMIT = 100
 # Discord caps a single select menu at 25 options; a View holds at most 5 rows.
@@ -644,9 +647,35 @@ class VoiceReceiver:
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
 
-    def __init__(self, voice_client, allowed_user_ids: set = None):
+    def __init__(self, voice_client, allowed_user_ids: set = None,
+                 silence_threshold: float = None, min_speech_duration: float = None,
+                 ptt_mode: bool = False):
         self._vc = voice_client
         self._allowed_user_ids = allowed_user_ids or set()
+        # Utterance cut timing: config-overridable (discord.voice_silence_threshold /
+        # discord.voice_min_speech_duration), class defaults otherwise. 1.5s of quiet
+        # is shorter than many natural mid-sentence pauses — lengthen to avoid
+        # chopped utterances.
+        self.SILENCE_THRESHOLD = (
+            float(silence_threshold) if silence_threshold else self.SILENCE_THRESHOLD)
+        self.MIN_SPEECH_DURATION = (
+            float(min_speech_duration) if min_speech_duration else self.MIN_SPEECH_DURATION)
+        # Push-to-talk mode: utterance boundaries come from Discord SPEAKING (op 5)
+        # key press/release transitions, NOT the silence timer. In PTT the 1.5s
+        # "silence = done" rule is wrong — it chops every pause longer than itself.
+        self._ptt_mode = bool(ptt_mode)
+        # PTT tail grace: after key release, wait this long for in-flight/reordered
+        # UDP packets before flushing the buffer.
+        self.PTT_TAIL_GRACE = 0.25
+        # PTT stale discard: a buffer whose release event was never seen (e.g.
+        # both op-5 events lost in the join race) is dropped after this much
+        # quiet. Ghost-buffer leak prevention ONLY — PCM accumulates at
+        # ~11MB/min/SSRC. Not a pause limit: a genuinely held key with a real
+        # release pending is never cut by a timer shorter than this.
+        self.PTT_STALE_SECONDS = 120.0
+        # Per-SSRC speaking state + release timestamps (ptt_mode bookkeeping).
+        self._speaking_active: Dict[int, bool] = {}
+        self._released_at: Dict[int, float] = {}
         self._running = False
         self._secret_key: Optional[bytes] = None
         self._dave_session = None
@@ -695,6 +724,21 @@ class VoiceReceiver:
     def resume(self):
         self._paused = False
 
+    def set_ptt_mode(self, ptt: bool) -> None:
+        """Switch PTT/open-mic live (via /voicemode). Clears PTT release/speaking
+        bookkeeping so a stale release window can't fire a bogus flush after the
+        switch. Any in-flight buffer simply continues under the NEW mode's rules:
+        in PTT it completes on the next release + grace; in open-mic on the
+        silence timer. (It is deliberately NOT flushed here — mid-speech audio
+        belongs to the utterance, not to the mode switch.)"""
+        with self._lock:
+            was = self._ptt_mode
+            self._ptt_mode = bool(ptt)
+            self._released_at.clear()
+            self._speaking_active.clear()
+        if was != bool(ptt):
+            logger.info("VoiceReceiver mode switched: ptt=%s", ptt)
+
     # --- SSRC -> user_id mapping via SPEAKING opcode hook ---
 
     def map_ssrc(self, ssrc: int, user_id: int):
@@ -715,6 +759,7 @@ class VoiceReceiver:
                 if ssrc and user_id:
                     logger.info("SPEAKING event: ssrc=%d -> user=%s", ssrc, user_id)
                     receiver_self.map_ssrc(int(ssrc), int(user_id))
+                    receiver_self.on_speaking_event(int(ssrc), bool(data.get("speaking")))
             if original_hook:
                 await original_hook(ws, msg)
         conn.hook = wrapped_hook
@@ -805,14 +850,14 @@ class VoiceReceiver:
             if not decrypted:
                 return
         # --- DAVE E2EE decrypt ---
+        with self._lock:
+            dave_user_id = self._ssrc_to_user.get(ssrc, 0)
         if self._dave_session:
-            with self._lock:
-                user_id = self._ssrc_to_user.get(ssrc, 0)
-            if user_id:
+            if dave_user_id:
                 try:
                     import davey
                     decrypted = self._dave_session.decrypt(
-                        user_id, davey.MediaType.audio, decrypted
+                        dave_user_id, davey.MediaType.audio, decrypted
                     )
                 except Exception as e:
                     # Unencrypted passthrough — use NaCl-decrypted data as-is
@@ -825,9 +870,31 @@ class VoiceReceiver:
             if ssrc not in self._decoders:
                 self._decoders[ssrc] = discord.opus.Decoder()
             pcm = self._decoders[ssrc].decode(decrypted)
+            # Eager SSRC binding (both modes): if this SSRC has no user yet, the
+            # SPEAKING press event was likely lost (the hook installs after
+            # channel.connect() returns — op-5 events in that gap never reach
+            # us). Bind on first packet instead of at flush time; without this,
+            # open-mic drops the audio as anonymous and PTT can never flush.
+            # One-shot per SSRC: inference walks channel.members, so it must not
+            # run per-packet. Runs INSIDE the lock — the socket reader thread
+            # must not race check_silence's map reads.
             with self._lock:
-                self._buffers[ssrc].extend(pcm)
-                self._last_packet_time[ssrc] = time.monotonic()
+                if ssrc not in self._ssrc_to_user:
+                    uid = self._infer_user_for_ssrc(ssrc)
+                    if uid:
+                        logger.info(
+                            "Eager SSRC bind: ssrc=%d -> user=%d on first packet (SPEAKING event not yet seen)",
+                            ssrc, uid)
+                        if self._ptt_mode:
+                            # Synthesize KEY-HELD only (missed press). Never a
+                            # release: a later real op-5 release flushes the
+                            # utterance; if that release is also lost, the
+                            # buffer waits for channel leave. No packet-gap
+                            # boundary invention in PTT — pauses while the key
+                            # is held are mid-utterance by definition.
+                            self._speaking_active[ssrc] = True
+            self._buffers[ssrc].extend(pcm)
+            self._last_packet_time[ssrc] = time.monotonic()
         except Exception as e:
             with self._lock:
                 self._decoders.pop(ssrc, None)
@@ -835,6 +902,23 @@ class VoiceReceiver:
             return
 
     # --- Silence detection ---
+
+    def on_speaking_event(self, ssrc: int, speaking: bool) -> None:
+        """Track SPEAKING op-5 transitions. In PTT mode a release (speaking=False)
+        marks the utterance boundary; check_silence flushes after the tail grace."""
+        if not self._ptt_mode:
+            return
+        now = time.monotonic()
+        with self._lock:
+            was = self._speaking_active.get(ssrc, False)
+            self._speaking_active[ssrc] = speaking
+            if was and not speaking:
+                # Key released: start the tail-grace window.
+                self._released_at[ssrc] = now
+                logger.info("PTT release: ssrc=%d (flush after %.2fs grace)", ssrc, self.PTT_TAIL_GRACE)
+            elif speaking:
+                # New press: cancel any pending release window.
+                self._released_at.pop(ssrc, None)
 
     def _infer_user_for_ssrc(self, ssrc: int) -> int:
         """Infer user_id for an unmapped SSRC: after a bot rejoin Discord may not resend
@@ -859,7 +943,11 @@ class VoiceReceiver:
         return 0
 
     def check_silence(self) -> list:
-        """Return list of (user_id, pcm_bytes) for completed utterances."""
+        """Return list of (user_id, pcm_bytes) for completed utterances.
+
+        PTT mode: flush a buffer after its SPEAKING release + PTT_TAIL_GRACE (the
+        silence timer is ignored — pauses while the key is held are mid-utterance).
+        Open-mic mode: flush after SILENCE_THRESHOLD of quiet (original behavior)."""
         now = time.monotonic()
         completed = []
         with self._lock:
@@ -871,6 +959,38 @@ class VoiceReceiver:
                 buf = self._buffers[ssrc]
                 # 48kHz, 16-bit, stereo = 192000 bytes/sec
                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
+                if self._ptt_mode:
+                    # NO synthesized releases in PTT: the key-held state set by
+                    # eager binding is flushed only by a REAL op-5 release
+                    # event (+ tail grace). Pauses while the key is held are
+                    # mid-utterance by definition — no packet-gap boundary
+                    # invention. If the release event is also lost, the buffer
+                    # waits for channel leave (flush_pending); the 120s stale
+                    # discard below is ghost-buffer leak prevention only.
+                    released_at = self._released_at.get(ssrc)
+                    # Flush once: release boundary seen AND tail grace elapsed
+                    # since the boundary. Grace is measured against the LATER of
+                    # (release event, last packet): op-5 release may arrive
+                    # before OR after the final RTP packet, and late packets
+                    # must extend the flush window either way.
+                    grace_anchor = max(released_at or 0.0, last_time)
+                    if (released_at is not None
+                            and now - grace_anchor >= self.PTT_TAIL_GRACE):
+                        user_id = ssrc_user_map.get(ssrc, 0) or self._infer_user_for_ssrc(ssrc)
+                        if user_id:
+                            completed.append((user_id, bytes(buf)))
+                        self._buffers[ssrc] = bytearray()
+                        self._released_at.pop(ssrc, None)
+                        self._speaking_active.pop(ssrc, None)
+                    elif silence_duration >= self.PTT_STALE_SECONDS:
+                        # Ghost buffer: SSRC whose release event was never seen
+                        # (e.g. both op-5 events lost in the join race). Leak
+                        # prevention only — PCM accumulates ~11MB/min/SSRC.
+                        self._buffers.pop(ssrc, None)
+                        self._speaking_active.pop(ssrc, None)
+                        self._released_at.pop(ssrc, None)
+                        self._last_packet_time.pop(ssrc, None)
+                    continue
                 if silence_duration >= self.SILENCE_THRESHOLD and buf_duration >= self.MIN_SPEECH_DURATION:
                     user_id = ssrc_user_map.get(ssrc, 0)
                     if not user_id:
@@ -894,7 +1014,10 @@ class VoiceReceiver:
             for ssrc, buf in list(self._buffers.items()):
                 # 48kHz, 16-bit, stereo = 192000 bytes/sec
                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
-                if buf_duration >= self.MIN_SPEECH_DURATION:
+                min_duration = 0.0 if self._ptt_mode else self.MIN_SPEECH_DURATION
+                # PTT: an intentional press is speech by definition — honor even
+                # very short presses (a whispered word may be <0.5s of audio).
+                if buf_duration >= max(min_duration, 0.0):
                     user_id = ssrc_user_map.get(ssrc, 0)
                     if not user_id:
                         user_id = self._infer_user_for_ssrc(ssrc)
@@ -902,6 +1025,8 @@ class VoiceReceiver:
                         completed.append((user_id, bytes(buf)))
                 self._buffers.pop(ssrc, None)
                 self._last_packet_time.pop(ssrc, None)
+                self._speaking_active.pop(ssrc, None)
+                self._released_at.pop(ssrc, None)
         return completed
 
     # --- PCM -> WAV conversion (for Whisper STT) ---
@@ -3381,7 +3506,15 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             if source is not None:
                 self._voice_sources[guild_id] = source
             try:
-                receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
+                receiver = VoiceReceiver(
+                    vc, allowed_user_ids=self._allowed_user_ids,
+                    silence_threshold=self._config_value(
+                        "voice_silence_duration", None, env_key="HERMES_DISCORD_VOICE_SILENCE_DURATION"),
+                    min_speech_duration=self._config_value(
+                        "voice_min_speech_duration", None,
+                        env_key="HERMES_DISCORD_VOICE_MIN_SPEECH_DURATION"),
+                    ptt_mode=bool(self._config_value("voice_ptt_mode", False)),
+                )
                 receiver.start()
                 self._voice_receivers[guild_id] = receiver
                 self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
@@ -3659,9 +3792,23 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             from tools.transcription_tools import transcribe_audio
             result = await asyncio.to_thread(transcribe_audio, wav_path)
             if not result.get("success"):
+                # Log the full envelope — silent returns here made a real STT
+                # outage (Deepgram hanging ~65s, empty transcripts) invisible
+                # on 2026-09-09. The branch matters: provider failure vs empty
+                # transcript vs hallucination filter have different fixes.
+                logger.warning(
+                    "Voice STT failed for user %d: %s", user_id, result)
                 return
             transcript = result.get("transcript", "").strip()
-            if not transcript or is_whisper_hallucination(transcript):
+            if not transcript:
+                logger.info(
+                    "Voice STT returned empty transcript for user %d (result=%s)",
+                    user_id, result)
+                return
+            if is_whisper_hallucination(transcript):
+                logger.info(
+                    "Voice STT filtered hallucination for user %d: %r",
+                    user_id, transcript[:60])
                 return
             logger.info("Voice input from user %d: %s", user_id, transcript[:100])
             if self._voice_input_callback:
@@ -4173,6 +4320,114 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 _handler = discord.app_commands.choices(**choices)(_handler)
         return _handler
 
+    def _register_voicemode_slash(self, tree) -> None:
+        """Register /voicemode: show or toggle voice input mode (PTT vs open mic).
+
+        Idempotent: the reconnect loop calls _register_slash_commands() again on
+        every retry against the SAME tree object — a bare tree.command() would
+        raise CommandAlreadyRegistered and abort the reconnect."""
+        existing = {getattr(c, "name", "") for c in tree.get_commands()}
+        if "voicemode" in existing:
+            return
+        @tree.command(name="voicemode", description="Show or toggle voice input mode (push-to-talk vs open mic)")
+        @discord.app_commands.describe(mode="ptt, open (mic), or leave empty to show the current mode")
+        async def slash_voicemode(
+            interaction: discord.Interaction, mode: str = "",
+        ):
+            await self._handle_voicemode_slash(interaction, mode)
+
+    async def _handle_voicemode_slash(
+        self, interaction: discord.Interaction, mode: str = "",
+    ) -> None:
+        """Show or toggle the voice input mode (PTT vs open mic).
+
+        Persists to ``discord.voice_ptt_mode`` via save_config_value AND applies
+        live to any running VoiceReceiver in this guild — no restart needed.
+        """
+        if not await self._check_slash_authorization(interaction, "/voicemode"):
+            return
+        deferred = await self._defer_unless_expired(
+            interaction,
+            "[Discord] /voicemode: interaction expired before defer.",
+        )
+        # Read the CURRENT mode fresh from config (config.yaml is the source of truth;
+        # the slash toggle writes it so the value survives gateway restarts).
+        current_ptt = False
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            current_ptt = bool((cfg.get("discord") or {}).get("voice_ptt_mode", False))
+        except Exception as e:
+            logger.warning("[Discord] /voicemode: could not read config: %s", e)
+
+        requested = mode.strip().lower()
+        if requested in {"", "show", "status"}:
+            label = "push-to-talk" if current_ptt else "open mic"
+            msg = (f"Voice input mode: **{label}**\n"
+                   f"Use `/voicemode ptt` or `/voicemode open` to switch.")
+            if deferred:
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+            return
+
+        if requested in {"ptt", "push", "push-to-talk", "push_to_talk"}:
+            new_ptt = True
+        elif requested in {"open", "mic", "open-mic", "open_mic", "voice"}:
+            new_ptt = False
+        else:
+            msg = "Unknown mode. Use `/voicemode ptt`, `/voicemode open`, or bare `/voicemode` to show current."
+            if deferred:
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+            return
+
+        if new_ptt == current_ptt:
+            label = "push-to-talk" if new_ptt else "open mic"
+            msg = f"Already in **{label}** mode — nothing changed."
+            if deferred:
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+            return
+
+        # Persist so the mode survives restarts.
+        try:
+            from cli import save_config_value
+            if not save_config_value("discord.voice_ptt_mode", new_ptt):
+                raise RuntimeError("save_config_value returned False")
+        except Exception as e:
+            logger.error("[Discord] /voicemode: failed to persist mode: %s", e)
+            msg = f"Failed to save the mode to config: {e}"
+            if deferred:
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+            return
+
+        # Apply live to any running receiver in this guild. In-flight audio
+        # continues under the new mode's rules (no flush — see set_ptt_mode).
+        applied = 0
+        guild_id = getattr(interaction, "guild_id", None)
+        if guild_id is not None:
+            receiver = self._voice_receivers.get(guild_id)
+            if receiver is not None:
+                try:
+                    receiver.set_ptt_mode(new_ptt)
+                    applied += 1
+                except Exception as e:
+                    logger.warning("[Discord] /voicemode: live-apply failed: %s", e)
+
+        label = "push-to-talk" if new_ptt else "open mic"
+        where = " (applied to the active voice session)" if applied else (
+            " (takes effect next time the bot joins a voice channel)")
+        msg = f"Voice input mode switched to **{label}**{where}."
+        if deferred:
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+
     def _register_thread_slash(self, tree, name: str, description: str) -> None:
         @tree.command(name=name, description=description)
         @discord.app_commands.describe(
@@ -4193,7 +4448,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         tree = self._client.tree
         for name, description, args, template, followup in _NATIVE_SLASH_COMMANDS:
             if template is None:
-                self._register_thread_slash(tree, name, description)
+                # /thread is the only thread-creating command. Other template-None
+                # commands (/voicemode) register their own custom handlers below —
+                # routing them here made /voicemode create threads.
+                if name != "voicemode":
+                    self._register_thread_slash(tree, name, description)
                 continue
             tree.command(name=name, description=description)(
                 self._slash_proxy(name, args, template, followup, strip=name != "insights")
@@ -4246,6 +4505,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         except Exception as e:
             logger.warning("Discord auto-register from plugin commands failed: %s", e)
         self._register_skill_group(tree)
+        self._register_voicemode_slash(tree)
         if dropped_over_cap:
             # One over-limit command makes Discord reject the entire sync (error 30032).
             logger.warning(

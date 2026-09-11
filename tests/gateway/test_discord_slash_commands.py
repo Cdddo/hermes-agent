@@ -141,6 +141,52 @@ async def test_registers_native_thread_slash_command(adapter):
     adapter._handle_thread_create_slash.assert_awaited_once_with(interaction, "Planning", "", 1440)
 
 
+# ------------------------------------------------------------------
+# /voicemode registration must not collide with the /thread handler
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_voicemode_slash_routes_to_voicemode_handler(adapter):
+    """Invoking ``/voicemode`` must reach the voice-mode handler only.
+
+    ``/thread`` and ``/voicemode`` are both declared with ``template=None`` in
+    ``_NATIVE_SLASH_COMMANDS``, and the dispatch loop routed every template-None
+    entry to ``_register_thread_slash``. That claimed the ``voicemode`` name
+    with the thread closure, so the real handler (registered later, behind its
+    idempotency guard) never installed and ``/voicemode`` created a thread.
+    """
+    adapter._handle_voicemode_slash = AsyncMock()
+    adapter._handle_thread_create_slash = AsyncMock()
+
+    adapter._register_slash_commands()
+
+    command = adapter._client.tree.commands["voicemode"]
+    interaction = SimpleNamespace(response=SimpleNamespace(defer=AsyncMock()))
+
+    await command(interaction, mode="ptt")
+
+    adapter._handle_voicemode_slash.assert_awaited_once_with(interaction, "ptt")
+    adapter._handle_thread_create_slash.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_thread_slash_still_routes_to_thread_handler(adapter):
+    """The /voicemode collision fix must leave /thread routing intact."""
+    adapter._handle_voicemode_slash = AsyncMock()
+    adapter._handle_thread_create_slash = AsyncMock()
+
+    adapter._register_slash_commands()
+
+    command = adapter._client.tree.commands["thread"]
+    interaction = SimpleNamespace(response=SimpleNamespace(defer=AsyncMock()))
+
+    await command(interaction, name="Planning", message="", auto_archive_duration=1440)
+
+    adapter._handle_thread_create_slash.assert_awaited_once_with(interaction, "Planning", "", 1440)
+    adapter._handle_voicemode_slash.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_run_simple_slash_executes_when_defer_interaction_expired(adapter):
     class UnknownInteraction(Exception):
